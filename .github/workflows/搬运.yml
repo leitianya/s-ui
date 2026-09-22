@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       src_repo:
-        description: "源仓库，格式：owner/repo"
-        required: true
-        default: "NanmiCoder/cc-haha"
+        description: "源仓库 owner/repo；留空则自动识别 Fork 上游仓库"
+        required: false
+        default: ""
 
       sync_missing_tags:
         description: "仅同步缺少的 Tag，不搬运 Release"
@@ -26,27 +26,27 @@ on:
           - range
 
       tag:
-        description: "单个版本号，仅 single 模式填写，例如：v0.1.1"
+        description: "单个版本号，仅 single 模式填写"
         required: false
         default: "v0.1.1"
 
       start_date:
-        description: "开始日期，仅 date 模式填写，格式：2026-01-01"
+        description: "开始日期，仅 date 模式填写，例如：2026-01-01"
         required: false
         default: ""
 
       end_date:
-        description: "结束日期，仅 date 模式填写，格式：2026-12-31"
+        description: "结束日期，仅 date 模式填写，例如：2026-12-31"
         required: false
         default: ""
 
       from_tag:
-        description: "起始版本，仅 range 模式填写，例如：v0.1.0"
+        description: "起始版本，仅 range 模式填写"
         required: false
         default: ""
 
       to_tag:
-        description: "结束版本，仅 range 模式填写，例如：v0.2.0"
+        description: "结束版本，仅 range 模式填写"
         required: false
         default: ""
 
@@ -86,7 +86,7 @@ jobs:
 
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SRC_REPO: ${{ inputs.src_repo }}
+      INPUT_SRC_REPO: ${{ inputs.src_repo }}
       TARGET_REPO: ${{ github.repository }}
 
       COPY_MODE: ${{ inputs.copy_mode }}
@@ -101,12 +101,69 @@ jobs:
       INCLUDE_PRERELEASES: ${{ inputs.include_prereleases }}
 
     steps:
-      - name: 检查运行环境
+      # ==========================================================
+      # 自动识别源仓库
+      #
+      # 1. 如果手动填写 src_repo，则使用手动值
+      # 2. 如果留空且当前仓库是 Fork，则使用上游仓库
+      # 3. 如果留空且不是 Fork，则使用当前仓库
+      # ==========================================================
+      - name: 自动识别源仓库
+        id: source
         shell: bash
         run: |
           set -euo pipefail
 
+          if [ -n "${INPUT_SRC_REPO}" ]; then
+            SRC_REPO="${INPUT_SRC_REPO}"
+            SOURCE_TYPE="手动指定"
+          else
+            SRC_REPO="$(
+              gh api \
+                "repos/${TARGET_REPO}" \
+                --jq '.parent.full_name // .full_name'
+            )"
+
+            PARENT_REPO="$(
+              gh api \
+                "repos/${TARGET_REPO}" \
+                --jq '.parent.full_name // empty'
+            )"
+
+            if [ -n "${PARENT_REPO}" ]; then
+              SOURCE_TYPE="自动识别 Fork 上游"
+            else
+              SOURCE_TYPE="当前仓库不是 Fork，使用当前仓库"
+            fi
+          fi
+
+          if ! printf '%s' "${SRC_REPO}" |
+            grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+
+            echo "::error::源仓库格式错误：${SRC_REPO}"
+            echo "::error::正确格式应为：owner/repo"
+            exit 1
+          fi
+
           echo "=========================================="
+          echo "源仓库识别完成"
+          echo "识别方式：${SOURCE_TYPE}"
+          echo "源仓库：${SRC_REPO}"
+          echo "目标仓库：${TARGET_REPO}"
+          echo "=========================================="
+
+          echo "src_repo=${SRC_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "source_type=${SOURCE_TYPE}" >> "${GITHUB_OUTPUT}"
+
+      - name: 检查运行环境
+        shell: bash
+        env:
+          SRC_REPO: ${{ steps.source.outputs.src_repo }}
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "运行环境检查"
           echo "源仓库：${SRC_REPO}"
           echo "目标仓库：${TARGET_REPO}"
           echo "=========================================="
@@ -127,15 +184,18 @@ jobs:
       # 一次性同步缺少的 Tag
       #
       # 开启 sync_missing_tags 后：
-      # 1. 只同步目标仓库缺少的 Tag
-      # 2. 已有 Tag 直接跳过
-      # 3. 不覆盖已有 Tag
-      # 4. 不删除任何 Tag
-      # 5. 不执行后面的 Release 搬运
+      # 1. 只同步目标仓库不存在的 Tag
+      # 2. 已存在的 Tag 一律跳过
+      # 3. 不比较已有 Tag
+      # 4. 不覆盖已有 Tag
+      # 5. 不删除任何 Tag
+      # 6. 不执行 Release 搬运
       # ==========================================================
       - name: 一次性同步缺少的 Tag
         if: ${{ inputs.sync_missing_tags == true }}
         shell: bash
+        env:
+          SRC_REPO: ${{ steps.source.outputs.src_repo }}
         run: |
           set -euo pipefail
 
@@ -161,17 +221,25 @@ jobs:
           : > "${FAILED_TAGS}"
 
           echo "=========================================="
-          echo "开始一次性同步缺少的 Tag"
+          echo "开始同步缺少的 Tag"
           echo "源仓库：${SRC_REPO}"
           echo "目标仓库：${TARGET_REPO}"
-          echo "同步规则：只新增、不覆盖、不修改、不删除"
+          echo "规则：只新增、不覆盖、不修改、不删除"
           echo "=========================================="
+
+          if [ "${SRC_REPO}" = "${TARGET_REPO}" ]; then
+            echo ""
+            echo "源仓库和目标仓库相同。"
+            echo "当前仓库不是 Fork，或者手动指定了当前仓库。"
+            echo "没有需要同步的 Tag。"
+            exit 0
+          fi
 
           git -C "${WORK_DIR}" init --quiet
           git -C "${WORK_DIR}" remote add upstream "${SOURCE_URL}"
           git -C "${WORK_DIR}" remote add target "${TARGET_URL}"
 
-          echo "正在读取源仓库 Tag 列表..."
+          echo "正在读取源仓库 Tag..."
 
           git ls-remote \
             --tags \
@@ -183,7 +251,7 @@ jobs:
             }' |
             sort -u > "${SOURCE_TAGS}"
 
-          echo "正在读取目标仓库 Tag 列表..."
+          echo "正在读取目标仓库 Tag..."
 
           git ls-remote \
             --tags \
@@ -200,9 +268,20 @@ jobs:
             "${TARGET_TAGS}" \
             > "${MISSING_TAGS}"
 
-          SOURCE_COUNT="$(wc -l < "${SOURCE_TAGS}" | tr -d ' ')"
-          TARGET_COUNT="$(wc -l < "${TARGET_TAGS}" | tr -d ' ')"
-          MISSING_COUNT="$(wc -l < "${MISSING_TAGS}" | tr -d ' ')"
+          SOURCE_COUNT="$(
+            wc -l < "${SOURCE_TAGS}" |
+            tr -d ' '
+          )"
+
+          TARGET_COUNT="$(
+            wc -l < "${TARGET_TAGS}" |
+            tr -d ' '
+          )"
+
+          MISSING_COUNT="$(
+            wc -l < "${MISSING_TAGS}" |
+            tr -d ' '
+          )"
 
           echo ""
           echo "=========================================="
@@ -210,7 +289,7 @@ jobs:
           echo "=========================================="
           echo "源仓库 Tag 数量：${SOURCE_COUNT}"
           echo "目标仓库 Tag 数量：${TARGET_COUNT}"
-          echo "需要同步的 Tag 数量：${MISSING_COUNT}"
+          echo "缺少的 Tag 数量：${MISSING_COUNT}"
 
           if [ "${MISSING_COUNT}" -eq 0 ]; then
             echo ""
@@ -236,10 +315,10 @@ jobs:
 
             echo ""
             echo "=========================================="
-            echo "[${CURRENT_NUMBER}/${MISSING_COUNT}] 处理 Tag：${TAG}"
+            echo "[${CURRENT_NUMBER}/${MISSING_COUNT}] ${TAG}"
             echo "=========================================="
 
-            # 推送前再次检查目标仓库，防止并发运行时出现同名 Tag
+            # 推送前再次检查，防止并发运行时出现同名 Tag
             if git ls-remote \
               --exit-code \
               --tags \
@@ -253,33 +332,45 @@ jobs:
               continue
             fi
 
-            echo "正在从源仓库获取 Tag：${TAG}"
+            echo "正在从源仓库获取：${TAG}"
 
             if ! git -C "${WORK_DIR}" fetch \
               --force \
               upstream \
               "refs/tags/${TAG}:refs/tags/${TAG}"; then
 
-              echo "::warning::获取源仓库 Tag 失败：${TAG}"
+              echo "::warning::获取源 Tag 失败：${TAG}"
               echo "${TAG}" >> "${FAILED_TAGS}"
               FAILED_COUNT=$((FAILED_COUNT + 1))
               continue
             fi
 
-            echo "正在将 Tag 推送到目标仓库：${TAG}"
+            echo "正在推送到目标仓库：${TAG}"
 
-            # 故意不使用 --force
-            # 因此即使目标仓库突然出现同名 Tag，也不会覆盖
+            # 不使用 --force，确保不会覆盖已有 Tag
             if git -C "${WORK_DIR}" push \
               target \
               "refs/tags/${TAG}:refs/tags/${TAG}"; then
 
-              echo "Tag 同步成功：${TAG}"
+              echo "同步成功：${TAG}"
               SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             else
-              echo "::warning::Tag 推送失败或目标仓库已存在同名 Tag：${TAG}"
-              echo "${TAG}" >> "${FAILED_TAGS}"
-              FAILED_COUNT=$((FAILED_COUNT + 1))
+              # 推送失败后再次检查，有可能是并发任务已创建同名 Tag
+              if git ls-remote \
+                --exit-code \
+                --tags \
+                --refs \
+                "${TARGET_URL}" \
+                "refs/tags/${TAG}" \
+                >/dev/null 2>&1; then
+
+                echo "目标仓库已出现同名 Tag，按已存在处理：${TAG}"
+                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              else
+                echo "::warning::同步失败：${TAG}"
+                echo "${TAG}" >> "${FAILED_TAGS}"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+              fi
             fi
           done < "${MISSING_TAGS}"
 
@@ -287,14 +378,14 @@ jobs:
           echo "=========================================="
           echo "Tag 同步完成"
           echo "=========================================="
-          echo "需要同步：${MISSING_COUNT}"
+          echo "缺少数量：${MISSING_COUNT}"
           echo "新增成功：${SUCCESS_COUNT}"
           echo "已存在跳过：${SKIPPED_COUNT}"
           echo "同步失败：${FAILED_COUNT}"
           echo ""
-          echo "本次操作没有覆盖已有 Tag"
-          echo "本次操作没有修改已有 Tag"
-          echo "本次操作没有删除任何 Tag"
+          echo "没有覆盖已有 Tag"
+          echo "没有修改已有 Tag"
+          echo "没有删除任何 Tag"
 
           if [ "${FAILED_COUNT}" -gt 0 ]; then
             echo ""
@@ -306,17 +397,17 @@ jobs:
           fi
 
           echo ""
-          echo "所有缺少的 Tag 均已同步完成。"
+          echo "所有缺少的 Tag 已同步完成。"
 
       # ==========================================================
       # 获取并筛选 Release
-      #
-      # 如果开启了 sync_missing_tags，本步骤不会运行。
       # ==========================================================
       - name: 获取并筛选 Release
         if: ${{ inputs.sync_missing_tags != true }}
         id: select
         shell: bash
+        env:
+          SRC_REPO: ${{ steps.source.outputs.src_repo }}
         run: |
           set -euo pipefail
 
@@ -324,66 +415,11 @@ jobs:
           SELECTED_FILE="${RUNNER_TEMP}/selected-releases.json"
 
           echo "=========================================="
-          echo "开始读取源仓库 Release"
+          echo "读取源仓库 Release"
+          echo "源仓库：${SRC_REPO}"
           echo "搬运模式：${COPY_MODE}"
           echo "=========================================="
 
           gh release list \
             --repo "${SRC_REPO}" \
             --limit 1000 \
-            --order asc \
-            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease \
-            > "${RELEASE_FILE}"
-
-          TOTAL_COUNT="$(jq 'length' "${RELEASE_FILE}")"
-
-          echo "源仓库共读取到 ${TOTAL_COUNT} 个 Release"
-
-          if [ "${TOTAL_COUNT}" -eq 0 ]; then
-            echo "::error::源仓库没有可读取的 Release"
-            exit 1
-          fi
-
-          case "${COPY_MODE}" in
-            single)
-              if [ -z "${SINGLE_TAG}" ]; then
-                echo "::error::single 模式必须填写 tag"
-                exit 1
-              fi
-
-              jq \
-                --arg tag "${SINGLE_TAG}" \
-                '[.[] | select(.tagName == $tag)]' \
-                "${RELEASE_FILE}" \
-                > "${SELECTED_FILE}"
-              ;;
-
-            all)
-              cp "${RELEASE_FILE}" "${SELECTED_FILE}"
-              ;;
-
-            date)
-              if [ -z "${START_DATE}" ] || [ -z "${END_DATE}" ]; then
-                echo "::error::date 模式必须填写 start_date 和 end_date"
-                exit 1
-              fi
-
-              if ! date -d "${START_DATE}" >/dev/null 2>&1; then
-                echo "::error::开始日期格式错误：${START_DATE}"
-                exit 1
-              fi
-
-              if ! date -d "${END_DATE}" >/dev/null 2>&1; then
-                echo "::error::结束日期格式错误：${END_DATE}"
-                exit 1
-              fi
-
-              START_TS="$(
-                date -u \
-                  -d "${START_DATE} 00:00:00" \
-                  '+%Y-%m-%dT%H:%M:%SZ'
-              )"
-
-              END_TS="$(
-                date -u \
-             
