@@ -1,0 +1,389 @@
+name: 一键搬运 Release（全功能通用版）
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_repo:
+        description: "源仓库，格式：owner/repo"
+        required: true
+        default: "NanmiCoder/cc-haha"
+
+      sync_missing_tags:
+        description: "仅同步缺少的 Tag，不搬运 Release"
+        required: true
+        type: boolean
+        default: false
+
+      copy_mode:
+        description: "Release 搬运模式"
+        required: true
+        type: choice
+        default: "single"
+        options:
+          - single
+          - all
+          - date
+          - range
+
+      tag:
+        description: "单个版本号，仅 single 模式填写，例如：v0.1.1"
+        required: false
+        default: "v0.1.1"
+
+      start_date:
+        description: "开始日期，仅 date 模式填写，格式：2026-01-01"
+        required: false
+        default: ""
+
+      end_date:
+        description: "结束日期，仅 date 模式填写，格式：2026-12-31"
+        required: false
+        default: ""
+
+      from_tag:
+        description: "起始版本，仅 range 模式填写，例如：v0.1.0"
+        required: false
+        default: ""
+
+      to_tag:
+        description: "结束版本，仅 range 模式填写，例如：v0.2.0"
+        required: false
+        default: ""
+
+      overwrite_assets:
+        description: "目标 Release 存在同名附件时是否覆盖"
+        required: true
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+      include_drafts:
+        description: "是否搬运草稿 Release"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+
+      include_prereleases:
+        description: "是否搬运预发布版本"
+        required: true
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SRC_REPO: ${{ inputs.src_repo }}
+      TARGET_REPO: ${{ github.repository }}
+
+      COPY_MODE: ${{ inputs.copy_mode }}
+      SINGLE_TAG: ${{ inputs.tag }}
+      START_DATE: ${{ inputs.start_date }}
+      END_DATE: ${{ inputs.end_date }}
+      FROM_TAG: ${{ inputs.from_tag }}
+      TO_TAG: ${{ inputs.to_tag }}
+
+      OVERWRITE_ASSETS: ${{ inputs.overwrite_assets }}
+      INCLUDE_DRAFTS: ${{ inputs.include_drafts }}
+      INCLUDE_PRERELEASES: ${{ inputs.include_prereleases }}
+
+    steps:
+      - name: 检查运行环境
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "源仓库：${SRC_REPO}"
+          echo "目标仓库：${TARGET_REPO}"
+          echo "=========================================="
+
+          gh --version
+          git --version
+          jq --version
+
+          echo "检查源仓库访问权限..."
+          gh repo view "${SRC_REPO}" >/dev/null
+
+          echo "检查目标仓库访问权限..."
+          gh repo view "${TARGET_REPO}" >/dev/null
+
+          echo "运行环境检查完成"
+
+      # ==========================================================
+      # 一次性同步缺少的 Tag
+      #
+      # 开启 sync_missing_tags 后：
+      # 1. 只同步目标仓库缺少的 Tag
+      # 2. 已有 Tag 直接跳过
+      # 3. 不覆盖已有 Tag
+      # 4. 不删除任何 Tag
+      # 5. 不执行后面的 Release 搬运
+      # ==========================================================
+      - name: 一次性同步缺少的 Tag
+        if: ${{ inputs.sync_missing_tags == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK_DIR="$(mktemp -d)"
+
+          cleanup() {
+            rm -rf "${WORK_DIR}"
+          }
+
+          trap cleanup EXIT
+
+          SOURCE_URL="https://github.com/${SRC_REPO}.git"
+          TARGET_URL="https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git"
+
+          SOURCE_TAGS="${WORK_DIR}/source-tags.txt"
+          TARGET_TAGS="${WORK_DIR}/target-tags.txt"
+          MISSING_TAGS="${WORK_DIR}/missing-tags.txt"
+          FAILED_TAGS="${WORK_DIR}/failed-tags.txt"
+
+          : > "${SOURCE_TAGS}"
+          : > "${TARGET_TAGS}"
+          : > "${MISSING_TAGS}"
+          : > "${FAILED_TAGS}"
+
+          echo "=========================================="
+          echo "开始一次性同步缺少的 Tag"
+          echo "源仓库：${SRC_REPO}"
+          echo "目标仓库：${TARGET_REPO}"
+          echo "同步规则：只新增、不覆盖、不修改、不删除"
+          echo "=========================================="
+
+          git -C "${WORK_DIR}" init --quiet
+          git -C "${WORK_DIR}" remote add upstream "${SOURCE_URL}"
+          git -C "${WORK_DIR}" remote add target "${TARGET_URL}"
+
+          echo "正在读取源仓库 Tag 列表..."
+
+          git ls-remote \
+            --tags \
+            --refs \
+            "${SOURCE_URL}" |
+            awk '{
+              sub("refs/tags/", "", $2)
+              print $2
+            }' |
+            sort -u > "${SOURCE_TAGS}"
+
+          echo "正在读取目标仓库 Tag 列表..."
+
+          git ls-remote \
+            --tags \
+            --refs \
+            "${TARGET_URL}" |
+            awk '{
+              sub("refs/tags/", "", $2)
+              print $2
+            }' |
+            sort -u > "${TARGET_TAGS}"
+
+          comm -23 \
+            "${SOURCE_TAGS}" \
+            "${TARGET_TAGS}" \
+            > "${MISSING_TAGS}"
+
+          SOURCE_COUNT="$(wc -l < "${SOURCE_TAGS}" | tr -d ' ')"
+          TARGET_COUNT="$(wc -l < "${TARGET_TAGS}" | tr -d ' ')"
+          MISSING_COUNT="$(wc -l < "${MISSING_TAGS}" | tr -d ' ')"
+
+          echo ""
+          echo "=========================================="
+          echo "Tag 扫描结果"
+          echo "=========================================="
+          echo "源仓库 Tag 数量：${SOURCE_COUNT}"
+          echo "目标仓库 Tag 数量：${TARGET_COUNT}"
+          echo "需要同步的 Tag 数量：${MISSING_COUNT}"
+
+          if [ "${MISSING_COUNT}" -eq 0 ]; then
+            echo ""
+            echo "目标仓库没有缺少的 Tag，无需处理。"
+            exit 0
+          fi
+
+          echo ""
+          echo "准备同步以下 Tag："
+          echo "------------------------------------------"
+          cat "${MISSING_TAGS}"
+          echo "------------------------------------------"
+
+          SUCCESS_COUNT=0
+          SKIPPED_COUNT=0
+          FAILED_COUNT=0
+          CURRENT_NUMBER=0
+
+          while IFS= read -r TAG; do
+            [ -n "${TAG}" ] || continue
+
+            CURRENT_NUMBER=$((CURRENT_NUMBER + 1))
+
+            echo ""
+            echo "=========================================="
+            echo "[${CURRENT_NUMBER}/${MISSING_COUNT}] 处理 Tag：${TAG}"
+            echo "=========================================="
+
+            # 推送前再次检查目标仓库，防止并发运行时出现同名 Tag
+            if git ls-remote \
+              --exit-code \
+              --tags \
+              --refs \
+              "${TARGET_URL}" \
+              "refs/tags/${TAG}" \
+              >/dev/null 2>&1; then
+
+              echo "目标仓库已经存在，跳过：${TAG}"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            echo "正在从源仓库获取 Tag：${TAG}"
+
+            if ! git -C "${WORK_DIR}" fetch \
+              --force \
+              upstream \
+              "refs/tags/${TAG}:refs/tags/${TAG}"; then
+
+              echo "::warning::获取源仓库 Tag 失败：${TAG}"
+              echo "${TAG}" >> "${FAILED_TAGS}"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              continue
+            fi
+
+            echo "正在将 Tag 推送到目标仓库：${TAG}"
+
+            # 故意不使用 --force
+            # 因此即使目标仓库突然出现同名 Tag，也不会覆盖
+            if git -C "${WORK_DIR}" push \
+              target \
+              "refs/tags/${TAG}:refs/tags/${TAG}"; then
+
+              echo "Tag 同步成功：${TAG}"
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              echo "::warning::Tag 推送失败或目标仓库已存在同名 Tag：${TAG}"
+              echo "${TAG}" >> "${FAILED_TAGS}"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+          done < "${MISSING_TAGS}"
+
+          echo ""
+          echo "=========================================="
+          echo "Tag 同步完成"
+          echo "=========================================="
+          echo "需要同步：${MISSING_COUNT}"
+          echo "新增成功：${SUCCESS_COUNT}"
+          echo "已存在跳过：${SKIPPED_COUNT}"
+          echo "同步失败：${FAILED_COUNT}"
+          echo ""
+          echo "本次操作没有覆盖已有 Tag"
+          echo "本次操作没有修改已有 Tag"
+          echo "本次操作没有删除任何 Tag"
+
+          if [ "${FAILED_COUNT}" -gt 0 ]; then
+            echo ""
+            echo "同步失败的 Tag："
+            cat "${FAILED_TAGS}"
+
+            echo "::error::有 ${FAILED_COUNT} 个 Tag 同步失败"
+            exit 1
+          fi
+
+          echo ""
+          echo "所有缺少的 Tag 均已同步完成。"
+
+      # ==========================================================
+      # 获取并筛选 Release
+      #
+      # 如果开启了 sync_missing_tags，本步骤不会运行。
+      # ==========================================================
+      - name: 获取并筛选 Release
+        if: ${{ inputs.sync_missing_tags != true }}
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_FILE="${RUNNER_TEMP}/all-releases.json"
+          SELECTED_FILE="${RUNNER_TEMP}/selected-releases.json"
+
+          echo "=========================================="
+          echo "开始读取源仓库 Release"
+          echo "搬运模式：${COPY_MODE}"
+          echo "=========================================="
+
+          gh release list \
+            --repo "${SRC_REPO}" \
+            --limit 1000 \
+            --order asc \
+            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease \
+            > "${RELEASE_FILE}"
+
+          TOTAL_COUNT="$(jq 'length' "${RELEASE_FILE}")"
+
+          echo "源仓库共读取到 ${TOTAL_COUNT} 个 Release"
+
+          if [ "${TOTAL_COUNT}" -eq 0 ]; then
+            echo "::error::源仓库没有可读取的 Release"
+            exit 1
+          fi
+
+          case "${COPY_MODE}" in
+            single)
+              if [ -z "${SINGLE_TAG}" ]; then
+                echo "::error::single 模式必须填写 tag"
+                exit 1
+              fi
+
+              jq \
+                --arg tag "${SINGLE_TAG}" \
+                '[.[] | select(.tagName == $tag)]' \
+                "${RELEASE_FILE}" \
+                > "${SELECTED_FILE}"
+              ;;
+
+            all)
+              cp "${RELEASE_FILE}" "${SELECTED_FILE}"
+              ;;
+
+            date)
+              if [ -z "${START_DATE}" ] || [ -z "${END_DATE}" ]; then
+                echo "::error::date 模式必须填写 start_date 和 end_date"
+                exit 1
+              fi
+
+              if ! date -d "${START_DATE}" >/dev/null 2>&1; then
+                echo "::error::开始日期格式错误：${START_DATE}"
+                exit 1
+              fi
+
+              if ! date -d "${END_DATE}" >/dev/null 2>&1; then
+                echo "::error::结束日期格式错误：${END_DATE}"
+                exit 1
+              fi
+
+              START_TS="$(
+                date -u \
+                  -d "${START_DATE} 00:00:00" \
+                  '+%Y-%m-%dT%H:%M:%SZ'
+              )"
+
+              END_TS="$(
+                date -u \
+             
