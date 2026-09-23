@@ -1,164 +1,198 @@
 name: Docker Image CI
+
+run-name: Docker ${{ inputs.source_tag || github.ref_name }}
+
 on:
   push:
     tags:
       - "*"
   workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "要构建的源码 Tag，例如 v1.6.3"
+        required: false
+        type: string
+        default: ""
 
-# The workflow pushes images; nothing here writes to the repository.
 permissions:
   contents: read
   packages: write
 
+env:
+  SOURCE_TAG: ${{ inputs.source_tag || github.ref_name }}
+
+concurrency:
+  group: docker-${{ github.repository }}-${{ inputs.source_tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    name: 检查版本
+    runs-on: ubuntu-24.04
+    outputs:
+      source_tag: ${{ steps.info.outputs.source_tag }}
+      image_name: ${{ steps.info.outputs.image_name }}
+    steps:
+      - name: 检查 Tag 和镜像名称
+        id: info
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${SOURCE_TAG}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          [ -n "${TAG}" ] || { echo "::error::没有指定 Tag"; exit 1; }
+          git ls-remote --exit-code --tags --refs "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}" >/dev/null 2>&1 || { echo "::error::Tag 不存在：${TAG}"; exit 1; }
+          echo "source_tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "image_name=${IMAGE}" >> "${GITHUB_OUTPUT}"
+
   frontend-build:
+    name: 构建前端
+    needs: validate
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ needs.validate.outputs.source_tag }}
           submodules: recursive
       - name: Set up Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 25
       - name: Install dependencies and build frontend
         run: |
+          set -euo pipefail
           cd frontend
-          npm install
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
           npm run build
       - name: Upload frontend build artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: frontend-dist
           path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 1
 
   build:
-    needs: frontend-build
+    name: 构建 ${{ matrix.platform }}
+    needs: [validate, frontend-build]
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { platform: linux/amd64 }
-          - { platform: linux/386 }
-          - { platform: linux/arm64/v8 }
-          - { platform: linux/arm/v7 }
-          - { platform: linux/arm/v6 }
+        platform:
+          - linux/amd64
+          - linux/386
+          - linux/arm64/v8
+          - linux/arm/v7
+          - linux/arm/v6
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate.outputs.source_tag }}
+          submodules: recursive
       - name: Download frontend build artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: frontend-dist
           path: frontend_dist
       - name: Prepare
+        id: prepare
         run: |
-          platform="${{ matrix.platform }}"
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: |
-            alireza7/s-ui
-            ghcr.io/alireza0/s-ui
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=pep440,pattern={{version}}
+          p='${{ matrix.platform }}'
+          echo "platform_pair=${p//\//-}" >> "${GITHUB_OUTPUT}"
+          echo "PLATFORM_PAIR=${p//\//-}" >> "${GITHUB_ENV}"
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-      - name: Cache Docker layers
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ matrix.platform }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-${{ matrix.platform }}-
-      - name: Login to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
       - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
+        with:
+          images: ${{ needs.validate.outputs.image_name }}
+          tags: type=raw,value=${{ needs.validate.outputs.source_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.source_tag }}
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           context: .
           file: Dockerfile.frontend-artifact
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          tags: |
-            alireza7/s-ui
-            ghcr.io/alireza0/s-ui
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
+          tags: ${{ needs.validate.outputs.image_name }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          echo "${digest#sha256:}" > "${{ runner.temp }}/digests/${digest#sha256:}"
+          set -euo pipefail
+          d='${{ steps.build.outputs.digest }}'; h="${d#sha256:}"
+          [ -n "${h}" ] || exit 1
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${h}"
       - name: Upload digest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}
+          name: digest-${{ steps.prepare.outputs.platform_pair }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    needs: build
+    name: 创建多架构镜像
+    needs: [validate, build]
     runs-on: ubuntu-24.04
     steps:
       - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-*
+          pattern: digest-*
           merge-multiple: true
-      - name: Login to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
       - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: |
-            alireza7/s-ui
-            ghcr.io/alireza0/s-ui
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=pep440,pattern={{version}}
-      - name: Create manifest list and push
-        env:
-          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+      - name: Create manifest list
         working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE_NAME: ${{ needs.validate.outputs.image_name }}
+          SOURCE_TAG: ${{ needs.validate.outputs.source_tag }}
         run: |
-          set -e
-          for img in alireza7/s-ui ghcr.io/alireza0/s-ui; do
-            TAGS_ARGS=$(echo "$DOCKER_METADATA_OUTPUT_JSON" | jq -cr --arg img "$img" '.tags | map(select(startswith($img))) | map("-t " + .) | join(" ")')
-            DIGEST_REFS=$(for f in *; do echo -n "${img}@sha256:$(cat "$f") "; done)
-            docker buildx imagetools create $TAGS_ARGS $DIGEST_REFS
-          done
+          set -euo pipefail
+          shopt -s nullglob
+          files=(*)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::没有摘要文件"; exit 1; }
+          refs=()
+          for f in "${files[@]}"; do refs+=("${IMAGE_NAME}@sha256:$(basename "${f}")"); done
+          docker buildx imagetools create --tag "${IMAGE_NAME}:${SOURCE_TAG}" "${refs[@]}"
+      - name: Inspect final image
+        env:
+          IMAGE_NAME: ${{ needs.validate.outputs.image_name }}
+          SOURCE_TAG: ${{ needs.validate.outputs.source_tag }}
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:${SOURCE_TAG}"
+      - name: 发布结果
+        env:
+          IMAGE_NAME: ${{ needs.validate.outputs.image_name }}
+          SOURCE_TAG: ${{ needs.validate.outputs.source_tag }}
+        run: |
+          echo "## Docker 镜像发布成功" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- 镜像：\`${IMAGE_NAME}:${SOURCE_TAG}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```bash' >> "${GITHUB_STEP_SUMMARY}"
+          echo "docker pull ${IMAGE_NAME}:${SOURCE_TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
