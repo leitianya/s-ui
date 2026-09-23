@@ -1,262 +1,123 @@
-name: 一键发布 Docker
-
-run-name: "发布 Docker: ${{ inputs.source_image }}:${{ inputs.source_tag }} -> ${{ github.repository }}"
+name: Docker Image CI
+run-name: "Docker ${{ inputs.source_tag || github.ref_name }}"
 
 on:
   workflow_dispatch:
     inputs:
-      source_image:
-        description: "源镜像，不含 Tag，例如 ghcr.io/alireza0/s-ui"
-        required: true
-        type: string
-        default: "ghcr.io/alireza0/s-ui"
       source_tag:
-        description: "源镜像 Tag，例如 v1.6.3 或 latest"
+        description: "源码 Tag，例如 v1.6.3"
         required: true
         type: string
-        default: "latest"
-      target_tag:
-        description: "目标 Tag，留空则与源 Tag 相同"
-        required: false
-        type: string
-        default: ""
-      update_latest:
-        description: "是否同时更新 latest"
-        required: true
-        type: boolean
-        default: true
-      no_clobber:
-        description: "目标 Tag 已存在时跳过，不覆盖"
-        required: true
-        type: boolean
-        default: false
-      dry_run:
-        description: "模拟运行，只检查源镜像和参数，不实际推送"
-        required: true
-        type: boolean
-        default: false
+  push:
+    tags:
+      - "*"
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: docker-copy-${{ github.repository }}-${{ inputs.target_tag || inputs.source_tag }}
+  group: docker-${{ github.repository }}-${{ inputs.source_tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  SOURCE_TAG: ${{ inputs.source_tag || github.ref_name }}
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
 jobs:
-  publish:
-    name: 搬运多架构 Docker 镜像
+  frontend:
     runs-on: ubuntu-24.04
-    env:
-      SOURCE_IMAGE: ${{ inputs.source_image }}
-      SOURCE_TAG: ${{ inputs.source_tag }}
-      INPUT_TARGET_TAG: ${{ inputs.target_tag }}
-      UPDATE_LATEST: ${{ inputs.update_latest }}
-      NO_CLOBBER: ${{ inputs.no_clobber }}
-      DRY_RUN: ${{ inputs.dry_run }}
-      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SOURCE_USERNAME: ${{ secrets.SOURCE_REGISTRY_USERNAME }}
-      SOURCE_TOKEN: ${{ secrets.SOURCE_REGISTRY_TOKEN }}
-
     steps:
-      - name: 检查输入并生成目标地址
-        id: prepare
-        shell: bash
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_TAG }}
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 构建前端
         run: |
           set -euo pipefail
+          cd frontend
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 1
 
-          if [ -z "${SOURCE_IMAGE}" ]; then
-            echo "::error::源镜像不能为空"
-            exit 1
-          fi
+  build:
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/386, linux/arm64/v8, linux/arm/v7, linux/arm/v6]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_TAG }}
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend_dist
+      - name: 平台名称
+        run: |
+          p='${{ matrix.platform }}'
+          echo "PAIR=${p//\//-}" >> "${GITHUB_ENV}"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 构建并按摘要推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.frontend-artifact
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE_NAME }}
+          cache-from: type=gha,scope=${{ env.PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PAIR }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+      - name: 导出摘要
+        run: |
+          d='${{ steps.build.outputs.digest }}'; h="${d#sha256:}"
+          mkdir -p "${RUNNER_TEMP}/digests"; touch "${RUNNER_TEMP}/digests/${h}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ env.PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
 
-          if [ -z "${SOURCE_TAG}" ]; then
-            echo "::error::源 Tag 不能为空"
-            exit 1
-          fi
-
-          if [[ "${SOURCE_IMAGE}" == *"@"* ]] || [[ "${SOURCE_IMAGE}" == *":"*/*":"* ]]; then
-            echo "::error::source_image 请不要包含 Tag 或 Digest：${SOURCE_IMAGE}"
-            exit 1
-          fi
-
-          TARGET_TAG="${INPUT_TARGET_TAG:-${SOURCE_TAG}}"
-          TARGET_IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          SOURCE_REF="${SOURCE_IMAGE}:${SOURCE_TAG}"
-          TARGET_REF="${TARGET_IMAGE}:${TARGET_TAG}"
-
-          if ! printf '%s' "${SOURCE_TAG}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
-            echo "::error::源 Tag 格式无效：${SOURCE_TAG}"
-            exit 1
-          fi
-
-          if ! printf '%s' "${TARGET_TAG}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
-            echo "::error::目标 Tag 格式无效：${TARGET_TAG}"
-            exit 1
-          fi
-
-          {
-            echo "target_tag=${TARGET_TAG}"
-            echo "target_image=${TARGET_IMAGE}"
-            echo "source_ref=${SOURCE_REF}"
-            echo "target_ref=${TARGET_REF}"
-          } >> "${GITHUB_OUTPUT}"
-
-          echo "=========================================="
-          echo "一键发布 Docker"
-          echo "=========================================="
-          echo "源镜像：${SOURCE_REF}"
-          echo "目标镜像：${TARGET_REF}"
-          echo "更新 latest：${UPDATE_LATEST}"
-          echo "禁止覆盖：${NO_CLOBBER}"
-          echo "模拟运行：${DRY_RUN}"
-
-      - name: 安装 crane
-        shell: bash
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: 创建多架构镜像
+        working-directory: ${{ runner.temp }}/digests
         run: |
           set -euo pipefail
-          CRANE_VERSION="v0.20.3"
-          go install "github.com/google/go-containerregistry/cmd/crane@${CRANE_VERSION}"
-          echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
-          "${HOME}/go/bin/crane" version
-
-      - name: 登录源镜像仓库（可选）
-        if: ${{ env.SOURCE_USERNAME != '' && env.SOURCE_TOKEN != '' }}
-        shell: bash
-        env:
-          SOURCE_REF: ${{ steps.prepare.outputs.source_ref }}
-        run: |
-          set -euo pipefail
-          SOURCE_REGISTRY="${SOURCE_REF%%/*}"
-          printf '%s' "${SOURCE_TOKEN}" | crane auth login "${SOURCE_REGISTRY}" \
-            --username "${SOURCE_USERNAME}" \
-            --password-stdin
-
-      - name: 登录目标 GHCR
-        if: ${{ inputs.dry_run == false }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf '%s' "${GHCR_TOKEN}" | crane auth login ghcr.io \
-            --username "${GITHUB_ACTOR}" \
-            --password-stdin
-
-      - name: 检查源镜像和多架构清单
-        id: inspect
-        shell: bash
-        env:
-          SOURCE_REF: ${{ steps.prepare.outputs.source_ref }}
-        run: |
-          set -euo pipefail
-
-          if ! crane manifest "${SOURCE_REF}" > "${RUNNER_TEMP}/source-manifest.json"; then
-            echo "::error::无法读取源镜像：${SOURCE_REF}"
-            echo "请确认镜像地址、Tag 和源仓库读取权限。"
-            exit 1
-          fi
-
-          SOURCE_DIGEST="$(crane digest "${SOURCE_REF}")"
-          MEDIA_TYPE="$(jq -r '.mediaType // empty' "${RUNNER_TEMP}/source-manifest.json")"
-          PLATFORM_COUNT="$(jq '[.manifests[]?] | length' "${RUNNER_TEMP}/source-manifest.json")"
-
-          echo "源镜像摘要：${SOURCE_DIGEST}"
-          echo "Manifest 类型：${MEDIA_TYPE:-未知}"
-          echo "平台数量：${PLATFORM_COUNT}"
-
-          {
-            echo "source_digest=${SOURCE_DIGEST}"
-            echo "platform_count=${PLATFORM_COUNT}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: 模拟运行结果
-        if: ${{ inputs.dry_run == true }}
-        shell: bash
-        env:
-          SOURCE_REF: ${{ steps.prepare.outputs.source_ref }}
-          TARGET_REF: ${{ steps.prepare.outputs.target_ref }}
-          SOURCE_DIGEST: ${{ steps.inspect.outputs.source_digest }}
-          PLATFORM_COUNT: ${{ steps.inspect.outputs.platform_count }}
-        run: |
-          set -euo pipefail
-          echo "=========================================="
-          echo "模拟运行成功"
-          echo "=========================================="
-          echo "已确认源镜像存在：${SOURCE_REF}"
-          echo "源摘要：${SOURCE_DIGEST}"
-          echo "平台数量：${PLATFORM_COUNT}"
-          echo "正式运行时将复制到：${TARGET_REF}"
-          echo "本次没有推送任何镜像。"
-
-      - name: 检查目标 Tag 是否已存在
-        if: ${{ inputs.dry_run == false && inputs.no_clobber == true }}
-        id: target_check
-        shell: bash
-        env:
-          TARGET_REF: ${{ steps.prepare.outputs.target_ref }}
-        run: |
-          set -euo pipefail
-          if crane manifest "${TARGET_REF}" >/dev/null 2>&1; then
-            echo "exists=true" >> "${GITHUB_OUTPUT}"
-            echo "目标 Tag 已存在，将按 no_clobber 设置跳过：${TARGET_REF}"
-          else
-            echo "exists=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: 复制完整多架构镜像
-        if: ${{ inputs.dry_run == false && (inputs.no_clobber == false || steps.target_check.outputs.exists != 'true') }}
-        shell: bash
-        env:
-          SOURCE_REF: ${{ steps.prepare.outputs.source_ref }}
-          TARGET_REF: ${{ steps.prepare.outputs.target_ref }}
-          SOURCE_DIGEST: ${{ steps.inspect.outputs.source_digest }}
-        run: |
-          set -euo pipefail
-
-          COPY_ARGS=()
-          if [ "${NO_CLOBBER}" = "true" ]; then
-            COPY_ARGS+=(--no-clobber)
-          fi
-
-          echo "正在复制完整镜像，包括多架构 manifest 和镜像层..."
-          crane copy "${COPY_ARGS[@]}" "${SOURCE_REF}" "${TARGET_REF}"
-
-          TARGET_DIGEST="$(crane digest "${TARGET_REF}")"
-          echo "源摘要：${SOURCE_DIGEST}"
-          echo "目标摘要：${TARGET_DIGEST}"
-
-          if [ "${SOURCE_DIGEST}" != "${TARGET_DIGEST}" ]; then
-            echo "::warning::源和目标摘要不同，目标注册表可能重写了 manifest"
-          else
-            echo "摘要一致，版本镜像复制成功。"
-          fi
-
-      - name: 同时更新 latest
-        if: ${{ inputs.dry_run == false && inputs.update_latest == true && (inputs.no_clobber == false || steps.target_check.outputs.exists != 'true') }}
-        shell: bash
-        env:
-          SOURCE_REF: ${{ steps.prepare.outputs.source_ref }}
-          TARGET_IMAGE: ${{ steps.prepare.outputs.target_image }}
-        run: |
-          set -euo pipefail
-          LATEST_REF="${TARGET_IMAGE}:latest"
-          crane copy "${SOURCE_REF}" "${LATEST_REF}"
-          echo "latest 已更新：${LATEST_REF}"
-          echo "latest 摘要：$(crane digest "${LATEST_REF}")"
-
-      - name: 输出发布结果
-        if: ${{ always() && inputs.dry_run == false }}
-        shell: bash
-        env:
-          TARGET_REF: ${{ steps.prepare.outputs.target_ref }}
-          TARGET_IMAGE: ${{ steps.prepare.outputs.target_image }}
-        run: |
-          set -euo pipefail
-          echo "=========================================="
-          echo "Docker 发布流程结束"
-          echo "=========================================="
-          echo "版本镜像：${TARGET_REF}"
-          if [ "${UPDATE_LATEST}" = "true" ]; then
-            echo "latest：${TARGET_IMAGE}:latest"
-          fi
-          echo "拉取命令：docker pull ${TARGET_REF}"
+          shopt -s nullglob
+          files=(*); [ "${#files[@]}" -gt 0 ] || exit 1
+          refs=(); for f in "${files[@]}"; do refs+=("${IMAGE_NAME}@sha256:$(basename "${f}")"); done
+          image="${IMAGE_NAME,,}"
+          docker buildx imagetools create -t "${image}:${SOURCE_TAG}" "${refs[@]}"
+          docker buildx imagetools inspect "${image}:${SOURCE_TAG}"
