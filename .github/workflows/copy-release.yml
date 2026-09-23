@@ -1,4 +1,4 @@
-name: 一键同步 Tag、Release 与 Docker
+name: 一键同步 Tag、Release 与 Docker 镜像
 run-name: "${{ inputs.operation }} / ${{ inputs.copy_mode }} / ${{ inputs.tag }}"
 
 on:
@@ -11,11 +11,16 @@ on:
         default: copy_release
         options:
           - copy_release
-          - publish_docker
+          - copy_docker
           - sync_missing_tags
           - check_pat
       src_repo:
         description: "源仓库 owner/repo，留空自动识别 Fork 上游"
+        required: false
+        type: string
+        default: ""
+      source_image:
+        description: "原作者镜像地址，留空自动使用 ghcr.io/源owner/源repo"
         required: false
         type: string
         default: ""
@@ -76,18 +81,27 @@ on:
         type: boolean
         default: true
       docker_skip_existing:
-        description: "Docker 镜像版本已存在时跳过"
+        description: "目标 Docker 镜像版本已存在时跳过"
         required: true
         type: boolean
         default: true
+      strip_v_prefix:
+        description: "源镜像 Tag 是否去掉开头 v，例如 v1.6.3 读取为 1.6.3"
+        required: true
+        type: boolean
+        default: false
+      update_latest:
+        description: "完成后将最后一个成功版本同时复制为 latest"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
-  actions: write
-  packages: read
+  packages: write
 
 concurrency:
-  group: sync-release-docker-${{ github.repository }}
+  group: direct-sync-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -96,11 +110,14 @@ jobs:
     outputs:
       src_repo: ${{ steps.repo.outputs.src_repo }}
       target_repo: ${{ steps.repo.outputs.target_repo }}
+      source_image: ${{ steps.repo.outputs.source_image }}
+      target_image: ${{ steps.repo.outputs.target_image }}
       selected_json: ${{ steps.select.outputs.selected_json }}
       selected_count: ${{ steps.select.outputs.selected_count }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       INPUT_SRC_REPO: ${{ inputs.src_repo }}
+      INPUT_SOURCE_IMAGE: ${{ inputs.source_image }}
       TARGET_REPO: ${{ github.repository }}
       COPY_MODE: ${{ inputs.copy_mode }}
       SINGLE_TAG: ${{ inputs.tag }}
@@ -112,7 +129,7 @@ jobs:
       INCLUDE_DRAFTS: ${{ inputs.include_drafts }}
       INCLUDE_PRERELEASES: ${{ inputs.include_prereleases }}
     steps:
-      - name: 自动识别源仓库
+      - name: 自动识别源仓库和镜像地址
         id: repo
         shell: bash
         run: |
@@ -124,14 +141,25 @@ jobs:
             SRC_REPO="$(jq -r '.parent.full_name // .full_name' <<< "${INFO}")"
           fi
           printf '%s' "${SRC_REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { echo "::error::源仓库格式错误"; exit 1; }
+          if [ -n "${INPUT_SOURCE_IMAGE}" ]; then
+            SOURCE_IMAGE="${INPUT_SOURCE_IMAGE,,}"
+          else
+            SOURCE_IMAGE="ghcr.io/${SRC_REPO,,}"
+          fi
+          TARGET_IMAGE="ghcr.io/${TARGET_REPO,,}"
           echo "源仓库：${SRC_REPO}"
-          echo "目标仓库：${TARGET_REPO}"
-          echo "src_repo=${SRC_REPO}" >> "${GITHUB_OUTPUT}"
-          echo "target_repo=${TARGET_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "源镜像：${SOURCE_IMAGE}"
+          echo "目标镜像：${TARGET_IMAGE}"
+          {
+            echo "src_repo=${SRC_REPO}"
+            echo "target_repo=${TARGET_REPO}"
+            echo "source_image=${SOURCE_IMAGE}"
+            echo "target_image=${TARGET_IMAGE}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: 选择版本
         id: select
-        if: ${{ inputs.operation == 'copy_release' || inputs.operation == 'publish_docker' }}
+        if: ${{ inputs.operation == 'copy_release' || inputs.operation == 'copy_docker' }}
         shell: bash
         env:
           SRC_REPO: ${{ steps.repo.outputs.src_repo }}
@@ -226,8 +254,7 @@ jobs:
             [ -n "${tag}" ] || continue
             if git -C "${W}" fetch --force upstream "refs/tags/${tag}:refs/tags/${tag}" && git -C "${W}" push "${T}" "refs/tags/${tag}:refs/tags/${tag}"; then OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
           done < "${W}/m"
-          echo "成功 ${OK}，失败 ${FAIL}"
-          [ "${FAIL}" -eq 0 ]
+          echo "成功 ${OK}，失败 ${FAIL}"; [ "${FAIL}" -eq 0 ]
 
   copy-release:
     needs: prepare
@@ -268,30 +295,82 @@ jobs:
           done < <(jq -r '.[].tagName' "${RUNNER_TEMP}/selected.json")
           echo "成功 ${OK}，失败 ${FAIL}"; [ "${FAIL}" -eq 0 ]
 
-  publish-docker:
+  copy-docker:
     needs: prepare
-    if: ${{ inputs.operation == 'publish_docker' }}
+    if: ${{ inputs.operation == 'copy_docker' }}
     runs-on: ubuntu-24.04
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+      SOURCE_IMAGE: ${{ needs.prepare.outputs.source_image }}
+      TARGET_IMAGE: ${{ needs.prepare.outputs.target_image }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
       SKIP_EXISTING: ${{ inputs.docker_skip_existing }}
+      STRIP_V: ${{ inputs.strip_v_prefix }}
+      UPDATE_LATEST: ${{ inputs.update_latest }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SOURCE_USERNAME: ${{ secrets.SOURCE_REGISTRY_USERNAME }}
+      SOURCE_TOKEN: ${{ secrets.SOURCE_REGISTRY_TOKEN }}
     steps:
-      - name: 检查并触发 Docker 工作流
+      - name: 安装 crane
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.20.3
+          echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
+          "${HOME}/go/bin/crane" version
+
+      - name: 登录源镜像仓库（私有源可选）
+        if: ${{ env.SOURCE_USERNAME != '' && env.SOURCE_TOKEN != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGISTRY="${SOURCE_IMAGE%%/*}"
+          printf '%s' "${SOURCE_TOKEN}" | crane auth login "${REGISTRY}" --username "${SOURCE_USERNAME}" --password-stdin
+
+      - name: 登录目标 GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | crane auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: 直接复制原作者多架构镜像
         shell: bash
         run: |
           set -euo pipefail
           printf '%s' "${SELECTED_JSON}" > "${RUNNER_TEMP}/selected.json"
-          IMAGE="ghcr.io/${TARGET_REPO,,}"
-          BRANCH="$(gh repo view "${TARGET_REPO}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
-          OK=0; SKIP=0; FAIL=0
-          while IFS= read -r tag; do
-            [ -n "${tag}" ] || continue
-            if ! git ls-remote --exit-code --tags --refs "https://github.com/${TARGET_REPO}.git" "refs/tags/${tag}" >/dev/null 2>&1; then echo "::warning::目标 Tag 不存在：${tag}"; FAIL=$((FAIL+1)); continue; fi
-            if [ "${SKIP_EXISTING}" = true ] && docker buildx imagetools inspect "${IMAGE}:${tag}" >/dev/null 2>&1; then echo "已存在，跳过：${IMAGE}:${tag}"; SKIP=$((SKIP+1)); continue; fi
-            if gh workflow run docker.yml -R "${TARGET_REPO}" --ref "${BRANCH}" -f "source_tag=${tag}"; then echo "已触发：${tag}"; OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
-            sleep 3
+          OK=0; SKIP=0; FAIL=0; LAST_SUCCESS=""
+          while IFS= read -r release_tag; do
+            [ -n "${release_tag}" ] || continue
+            source_tag="${release_tag}"
+            if [ "${STRIP_V}" = true ]; then source_tag="${source_tag#v}"; fi
+            SOURCE_REF="${SOURCE_IMAGE}:${source_tag}"
+            TARGET_REF="${TARGET_IMAGE}:${release_tag}"
+            echo "=========================================="
+            echo "源：${SOURCE_REF}"
+            echo "目标：${TARGET_REF}"
+            if ! crane manifest "${SOURCE_REF}" >/dev/null 2>&1; then
+              echo "::warning::原作者镜像不存在：${SOURCE_REF}"
+              FAIL=$((FAIL+1)); continue
+            fi
+            if [ "${SKIP_EXISTING}" = true ] && crane manifest "${TARGET_REF}" >/dev/null 2>&1; then
+              echo "目标镜像已存在，跳过：${TARGET_REF}"
+              SKIP=$((SKIP+1)); continue
+            fi
+            SOURCE_DIGEST="$(crane digest "${SOURCE_REF}")"
+            if crane copy "${SOURCE_REF}" "${TARGET_REF}"; then
+              TARGET_DIGEST="$(crane digest "${TARGET_REF}")"
+              echo "源摘要：${SOURCE_DIGEST}"
+              echo "目标摘要：${TARGET_DIGEST}"
+              LAST_SUCCESS="${SOURCE_REF}"
+              OK=$((OK+1))
+            else
+              echo "::warning::复制失败：${SOURCE_REF}"
+              FAIL=$((FAIL+1))
+            fi
           done < <(jq -r '.[].tagName' "${RUNNER_TEMP}/selected.json")
-          echo "触发 ${OK}，跳过 ${SKIP}，失败 ${FAIL}"
+          if [ "${UPDATE_LATEST}" = true ] && [ -n "${LAST_SUCCESS}" ]; then
+            crane copy "${LAST_SUCCESS}" "${TARGET_IMAGE}:latest"
+            echo "已更新：${TARGET_IMAGE}:latest"
+          fi
+          echo "成功 ${OK}，跳过 ${SKIP}，失败 ${FAIL}"
+          echo "目标镜像：${TARGET_IMAGE}"
           [ "${FAIL}" -eq 0 ]
