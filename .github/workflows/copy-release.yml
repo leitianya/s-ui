@@ -195,6 +195,8 @@ jobs:
       external_git_mode: ${{ steps.repository.outputs.external_git_mode }}
       selected_json: ${{ steps.final.outputs.selected_json }}
       selected_count: ${{ steps.final.outputs.selected_count }}
+      docker_versions_json: ${{ steps.docker_order.outputs.docker_versions_json }}
+      docker_versions_count: ${{ steps.docker_order.outputs.docker_versions_count }}
     env:
       GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       INPUT_SRC_REPO: ${{ inputs.src_repo }}
@@ -429,6 +431,55 @@ jobs:
           echo "selected_json=${JSON}" >> "${GITHUB_OUTPUT}"
           echo "selected_count=${COUNT}" >> "${GITHUB_OUTPUT}"
 
+      - name: 为 Docker 生成与 clean_snapshot 一致的有序版本清单
+        id: docker_order
+        if: ${{ inputs.run_copy_docker }}
+        env:
+          SELECTED_JSON: ${{ steps.final.outputs.selected_json }}
+          TAG_SYNC_MODE: ${{ inputs.tag_sync_mode }}
+          SOURCE_KIND: ${{ steps.repository.outputs.source_kind }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT_FILE="${RUNNER_TEMP}/docker-versions-input.json"
+          OUTPUT_FILE="${RUNNER_TEMP}/docker-versions-ordered.json"
+          printf '%s' "${SELECTED_JSON}" > "${INPUT_FILE}"
+          jq -e 'type=="array" and length>0' "${INPUT_FILE}" >/dev/null \
+            || { echo "::error::没有可供 Docker 使用的版本"; exit 1; }
+
+          if [ "${SOURCE_KIND}" = "github" ] && [ "${TAG_SYNC_MODE}" = "clean_snapshot" ]; then
+            python3 - "${INPUT_FILE}" "${OUTPUT_FILE}" <<'PYCODE'
+          import json, re, sys
+          src, dst = sys.argv[1:3]
+          with open(src, encoding='utf-8') as f:
+              items = json.load(f)
+          
+          def natural_key(item):
+              tag = str(item.get('tagName', ''))
+              normalized = re.sub(r'^[vV](?=\d)', '', tag)
+              parts = re.split(r'(\d+)', normalized)
+              key = []
+              for part in parts:
+                  key.append((0, int(part)) if part.isdigit() else (1, part.lower()))
+              published = item.get('publishedAt') or item.get('createdAt') or ''
+              return (key, published, tag.lower())
+          
+          items.sort(key=natural_key)
+          with open(dst, 'w', encoding='utf-8') as f:
+              json.dump(items, f, ensure_ascii=False, separators=(',', ':'))
+          PYCODE
+            echo "clean_snapshot 已作用于 Docker：按自然版本号从旧到新排序。"
+          else
+            jq -c '.' "${INPUT_FILE}" > "${OUTPUT_FILE}"
+            echo "Docker 保持原版本选择顺序：source_kind=${SOURCE_KIND}，tag_sync_mode=${TAG_SYNC_MODE}。"
+          fi
+
+          echo "Docker 最终处理顺序："
+          jq -r '.[].tagName' "${OUTPUT_FILE}" | nl -ba
+          JSON="$(jq -c . "${OUTPUT_FILE}")"
+          echo "docker_versions_json=${JSON}" >> "${GITHUB_OUTPUT}"
+          echo "docker_versions_count=$(jq length "${OUTPUT_FILE}")" >> "${GITHUB_OUTPUT}"
+
   mirror-external-git:
     name: 搬运外部 Git 全部分支和 Tag
     needs: prepare
@@ -632,7 +683,7 @@ jobs:
       GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
-      SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
+      SELECTED_JSON: ${{ needs.prepare.outputs.docker_versions_json || needs.prepare.outputs.selected_json }}
       REMOVE_PATHS: ${{ inputs.clean_remove_paths }}
     steps:
       - name: 创建不含指定路径的新根提交并推送同名 Tag
@@ -650,7 +701,7 @@ jobs:
           git -C "${CONTROL}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if [ "${{ inputs.sync_scope }}" = selected ]; then
-            printf '%s' "${SELECTED_JSON}"|jq -r '.[].tagName'|sort -u > "${CONTROL}/candidates"
+            printf '%s' "${SELECTED_JSON}" | jq -r '.[].tagName' | awk '!seen[$0]++' > "${CONTROL}/candidates"
           else
             git ls-remote --tags --refs "${SOURCE_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/source"
             git ls-remote --tags --refs "${TARGET_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/target"
@@ -936,7 +987,9 @@ jobs:
       SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       IMAGE_MAPPINGS: ${{ inputs.image_mappings }}
-      SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
+      SELECTED_JSON: ${{ needs.prepare.outputs.docker_versions_json }}
+      SELECTED_COUNT: ${{ needs.prepare.outputs.docker_versions_count }}
+      TAG_SYNC_MODE: ${{ inputs.tag_sync_mode }}
       SKIP_EXISTING: ${{ inputs.docker_skip_existing }}
       STRIP_V_PREFIX: ${{ inputs.strip_v_prefix }}
       UPDATE_LATEST: ${{ inputs.update_latest }}
@@ -1021,13 +1074,15 @@ jobs:
           [ "${MAP_COUNT}" -gt 0 ] || { echo "::error::没有生成 Docker 映射"; exit 1; }
           [ "${VERSION_COUNT}" -gt 0 ] || { echo "::error::没有选中 Docker 版本"; exit 1; }
           echo "准备搬运：镜像映射 ${MAP_COUNT} 个，精准版本 ${VERSION_COUNT} 个。"
+          echo "Docker 排序来源：tag_sync_mode=${TAG_SYNC_MODE}；prepare 输出数量=${SELECTED_COUNT}。"
+          echo "Docker 实际处理顺序："
+          jq -r '.[].tagName' "${VERSIONS}" | nl -ba
           OK=0; SKIP=0; MISSING=0; FAIL=0
           while IFS=$'\t' read -r source_image target_name; do
             target_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${target_name}"; last=""
             while IFS= read -r release_tag; do
               [ -n "${release_tag}" ] || continue
               target_ref="${target_image}:${release_tag}"
-              if [ "${SKIP_EXISTING}" = true ] && crane manifest "${target_ref}" >/dev/null 2>&1; then echo "跳过 ${target_ref}" >> "${SUMMARY}"; SKIP=$((SKIP+1)); continue; fi
               CANDIDATES=()
               if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}" "${release_tag}");
               else CANDIDATES+=("${release_tag}"); if [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}"); else CANDIDATES+=("v${release_tag}"); fi; fi
@@ -1037,9 +1092,23 @@ jobs:
                 if crane manifest "${ref}" >/dev/null 2>&1; then source_ref="${ref}"; break; fi
               done
               if [ -z "${source_ref}" ]; then echo "缺失（已匹配）：${checked}" >> "${SUMMARY}"; MISSING=$((MISSING+1)); continue; fi
+
+              if [ "${SKIP_EXISTING}" = true ] && crane manifest "${target_ref}" >/dev/null 2>&1; then
+                echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"
+                last="${source_ref}"
+                SKIP=$((SKIP+1))
+                continue
+              fi
               if crane copy "${source_ref}" "${target_ref}"; then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); else echo "失败 ${source_ref}" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
             done < <(jq -r '.[].tagName' "${VERSIONS}")
-            if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then crane copy "${last}" "${target_image}:latest" || FAIL=$((FAIL+1)); fi
+            if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then
+              if crane copy "${last}" "${target_image}:latest"; then
+                echo "latest 更新成功：${last} -> ${target_image}:latest" >> "${SUMMARY}"
+              else
+                echo "latest 更新失败：${last} -> ${target_image}:latest" >> "${SUMMARY}"
+                FAIL=$((FAIL+1))
+              fi
+            fi
           done < "${MAP}"
           echo "Docker 成功：${OK}；跳过：${SKIP}；缺失：${MISSING}；失败：${FAIL}"; cat "${SUMMARY}"
           TOTAL=$((OK+SKIP+MISSING+FAIL)); [ "${TOTAL}" -gt 0 ] || { echo "::error::没有处理任何 Docker 镜像"; exit 1; }
