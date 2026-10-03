@@ -13,7 +13,7 @@ on:
         default: false
 
       run_sync_tags:
-        description: "同步缺少的 Tag 和源码快照"
+        description: "同步 Tag/源码；源仓库为完整 Git URL 时搬运全部分支和 Tag"
         required: true
         type: boolean
         default: false
@@ -67,7 +67,7 @@ on:
         default: false
 
       src_repo:
-        description: "源仓库 owner/repo；留空自动识别 Fork 上游"
+        description: "GitHub owner/repo、完整 Git URL；URL|mirror 严格镜像；Docker 独立填 none"
         required: false
         type: string
         default: ""
@@ -82,7 +82,7 @@ on:
           - selected
 
       image_mappings:
-        description: "Docker 映射，多个用分号分隔；留空自动使用上游 GHCR"
+        description: "Docker 映射：源=目标|用户名|Token；多个用分号；none 模式配合 tag/tag_list"
         required: false
         type: string
         default: ""
@@ -191,6 +191,8 @@ jobs:
     outputs:
       src_repo: ${{ steps.repository.outputs.src_repo }}
       target_repo: ${{ steps.repository.outputs.target_repo }}
+      source_kind: ${{ steps.repository.outputs.source_kind }}
+      external_git_mode: ${{ steps.repository.outputs.external_git_mode }}
       selected_json: ${{ steps.final.outputs.selected_json }}
       selected_count: ${{ steps.final.outputs.selected_count }}
     env:
@@ -223,25 +225,64 @@ jobs:
           echo "搬运 Release：${{ inputs.run_copy_release }}"
           echo "搬运 Docker：${{ inputs.run_copy_docker }}"
 
+          if [[ "${INPUT_SRC_REPO}" =~ ^(https?://|ssh://|git://|git@) ]]; then
+            [ "${{ inputs.run_sync_tags }}" = "true" ] || { echo "::error::完整 Git URL 模式必须勾选同步 Tag/源码"; exit 1; }
+            [ "${{ inputs.run_copy_release }}" != "true" ] || { echo "::error::外部 Git URL 模式不支持搬运 GitHub Release"; exit 1; }
+            [ "${{ inputs.run_copy_docker }}" != "true" ] || { echo "::error::外部 Git URL 模式请单独运行，不能同时搬运 Docker"; exit 1; }
+          fi
+
+          if [ "${INPUT_SRC_REPO,,}" = "none" ]; then
+            [ "${{ inputs.run_copy_docker }}" = "true" ] || { echo "::error::src_repo=none 仅支持单独 Docker 搬运"; exit 1; }
+            [ "${{ inputs.run_sync_tags }}" != "true" ] || { echo "::error::src_repo=none 不能同步 Git Tag"; exit 1; }
+            [ "${{ inputs.run_copy_release }}" != "true" ] || { echo "::error::src_repo=none 不能搬运 Release"; exit 1; }
+            case "${COPY_MODE}" in
+              single|multiple) ;;
+              *) echo "::error::src_repo=none 仅支持 single 或 multiple 精准 Docker Tag；all/date/range 需要 GitHub Release 仓库"; exit 1 ;;
+            esac
+          fi
+
       - name: 自动识别源仓库
         id: repository
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "${INPUT_SRC_REPO}" ]; then
+          EXTERNAL_GIT_MODE="safe"
+          RAW_SRC_REPO="${INPUT_SRC_REPO}"
+          if [[ "${RAW_SRC_REPO,,}" == *"|mirror" ]]; then
+            EXTERNAL_GIT_MODE="mirror"
+            INPUT_SRC_REPO="${RAW_SRC_REPO%|*}"
+            INPUT_SRC_REPO="$(printf '%s' "${INPUT_SRC_REPO}" | xargs)"
+            [ -n "${INPUT_SRC_REPO}" ] || { echo "::error::|mirror 前缺少 Git 仓库地址"; exit 1; }
+          elif [[ "${RAW_SRC_REPO}" == *"|"* ]]; then
+            echo "::error::外部 Git 地址后缀无效，仅支持 |mirror"
+            exit 1
+          fi
+
+          if [ "${INPUT_SRC_REPO,,}" = "none" ]; then
+            SOURCE_REPO="none"
+            SOURCE_KIND="docker_none"
+            SOURCE_TYPE="Docker 独立精准版本模式，跳过 GitHub 源仓库"
+          elif [[ "${INPUT_SRC_REPO}" =~ ^(https?://|ssh://|git://|git@) ]]; then
             SOURCE_REPO="${INPUT_SRC_REPO}"
-            SOURCE_TYPE="手动指定"
+            SOURCE_KIND="external_git"
+            SOURCE_TYPE="外部标准 Git 仓库 URL，模式=${EXTERNAL_GIT_MODE}"
+            if [[ "${SOURCE_REPO}" =~ ^https?://[^/]*@ ]]; then
+              echo "::error::禁止在 Git URL 中直接携带用户名或 Token"
+              exit 1
+            fi
+            git ls-remote "${SOURCE_REPO}" HEAD >/dev/null || { echo "::error::外部 Git 仓库无法访问：${SOURCE_REPO}"; exit 1; }
+          elif [ -n "${INPUT_SRC_REPO}" ]; then
+            SOURCE_REPO="${INPUT_SRC_REPO}"
+            SOURCE_KIND="github"
+            SOURCE_TYPE="手动指定 GitHub 仓库"
           else
             REPOSITORY_JSON="$(gh api "repos/${TARGET_REPO}")"
             SOURCE_REPO="$(jq -r '.parent.full_name // .full_name' <<< "${REPOSITORY_JSON}")"
-            if [ "${SOURCE_REPO}" = "${TARGET_REPO}" ]; then
-              SOURCE_TYPE="当前仓库不是 Fork"
-            else
-              SOURCE_TYPE="自动识别 Fork 上游"
-            fi
+            SOURCE_KIND="github"
+            if [ "${SOURCE_REPO}" = "${TARGET_REPO}" ]; then SOURCE_TYPE="当前仓库不是 Fork"; else SOURCE_TYPE="自动识别 Fork 上游"; fi
           fi
 
-          if ! printf '%s' "${SOURCE_REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+          if [ "${SOURCE_KIND}" = "github" ] && ! printf '%s' "${SOURCE_REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
             echo "::error::源仓库格式错误：${SOURCE_REPO}"
             exit 1
           fi
@@ -251,6 +292,8 @@ jobs:
           echo "目标仓库：${TARGET_REPO}"
           echo "src_repo=${SOURCE_REPO}" >> "${GITHUB_OUTPUT}"
           echo "target_repo=${TARGET_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "source_kind=${SOURCE_KIND}" >> "${GITHUB_OUTPUT}"
+          echo "external_git_mode=${EXTERNAL_GIT_MODE}" >> "${GITHUB_OUTPUT}"
 
       - name: 检查运行环境和仓库访问
         env:
@@ -261,12 +304,12 @@ jobs:
           git --version
           jq --version
           curl --version
-          gh repo view "${SOURCE_REPO}" >/dev/null
+          if [ "${{ steps.repository.outputs.source_kind }}" = "github" ]; then gh repo view "${SOURCE_REPO}" >/dev/null; fi
           gh repo view "${TARGET_REPO}" >/dev/null
 
       - name: 获取并筛选 Release 版本
         id: select
-        if: ${{ inputs.run_copy_release || inputs.run_copy_docker || (inputs.run_sync_tags && inputs.sync_scope == 'selected') }}
+        if: ${{ steps.repository.outputs.source_kind == 'github' && (inputs.run_copy_release || inputs.run_copy_docker || (inputs.run_sync_tags && inputs.sync_scope == 'selected')) }}
         env:
           SOURCE_REPO: ${{ steps.repository.outputs.src_repo }}
         shell: bash
@@ -343,19 +386,110 @@ jobs:
           echo "selected_json=$(jq -c . "${OUT}")" >> "${GITHUB_OUTPUT}"
           echo "selected_count=${COUNT}" >> "${GITHUB_OUTPUT}"
 
+      - name: Docker 独立模式生成精准版本
+        id: docker_direct
+        if: ${{ steps.repository.outputs.src_repo == 'none' && inputs.run_copy_docker }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/docker-direct-versions.json"
+          REQUESTED="${RUNNER_TEMP}/docker-direct-tags.txt"
+          case "${COPY_MODE}" in
+            single)
+              [ -n "${SINGLE_TAG}" ] || { echo "::error::none + single 必须填写 tag，例如 v8.0.45"; exit 1; }
+              printf '%s\n' "${SINGLE_TAG}" > "${REQUESTED}"
+              ;;
+            multiple)
+              [ -n "${TAG_LIST}" ] || { echo "::error::none + multiple 必须填写 tag_list"; exit 1; }
+              printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u > "${REQUESTED}"
+              ;;
+            *)
+              echo "::error::none 模式仅支持 single 或 multiple"
+              exit 1
+              ;;
+          esac
+          [ -s "${REQUESTED}" ] || { echo "::error::没有有效的 Docker Tag"; exit 1; }
+          jq -R -s 'split("\n") | map(select(length>0)) | map({tagName:.,name:.,publishedAt:null,createdAt:null,isDraft:false,isPrerelease:false})' "${REQUESTED}" > "${OUT}"
+          COUNT="$(jq length "${OUT}")"
+          echo "Docker 独立精准版本："
+          jq -r '.[].tagName' "${OUT}" | nl -ba
+          echo "selected_json=$(jq -c . "${OUT}")" >> "${GITHUB_OUTPUT}"
+          echo "selected_count=${COUNT}" >> "${GITHUB_OUTPUT}"
+
       - name: 设置输出
         id: final
         env:
-          JSON: ${{ steps.select.outputs.selected_json }}
-          COUNT: ${{ steps.select.outputs.selected_count }}
+          RELEASE_JSON: ${{ steps.select.outputs.selected_json }}
+          RELEASE_COUNT: ${{ steps.select.outputs.selected_count }}
+          DIRECT_JSON: ${{ steps.docker_direct.outputs.selected_json }}
+          DIRECT_COUNT: ${{ steps.docker_direct.outputs.selected_count }}
         run: |
-          echo "selected_json=${JSON:-[]}" >> "${GITHUB_OUTPUT}"
-          echo "selected_count=${COUNT:-0}" >> "${GITHUB_OUTPUT}"
+          JSON="${DIRECT_JSON:-${RELEASE_JSON:-[]}}"
+          COUNT="${DIRECT_COUNT:-${RELEASE_COUNT:-0}}"
+          echo "selected_json=${JSON}" >> "${GITHUB_OUTPUT}"
+          echo "selected_count=${COUNT}" >> "${GITHUB_OUTPUT}"
+
+  mirror-external-git:
+    name: 搬运外部 Git 全部分支和 Tag
+    needs: prepare
+    if: ${{ inputs.run_sync_tags && needs.prepare.outputs.source_kind == 'external_git' }}
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_GIT_URL: ${{ needs.prepare.outputs.src_repo }}
+      EXTERNAL_GIT_MODE: ${{ needs.prepare.outputs.external_git_mode }}
+      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+      PUSH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 裸克隆并推送全部分支和 Tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${PUSH_TOKEN}" ] || { echo "::error::缺少可写入目标仓库的 Token"; exit 1; }
+          echo "::add-mask::${PUSH_TOKEN}"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "${WORK}"' EXIT
+          BARE_REPO="${WORK}/source.git"
+          TARGET_URL="https://x-access-token:${PUSH_TOKEN}@github.com/${TARGET_REPO}.git"
+
+          echo "外部源仓库：${SOURCE_GIT_URL}"
+          echo "GitHub 目标仓库：${TARGET_REPO}"
+          echo "同步模式：${EXTERNAL_GIT_MODE}"
+
+          if [ "${EXTERNAL_GIT_MODE}" = "mirror" ]; then
+            echo "::warning::严格 mirror 会让目标 Git 引用与源仓库一致，并删除目标中源端不存在的引用。"
+            git clone --mirror "${SOURCE_GIT_URL}" "${BARE_REPO}"
+          else
+            git clone --bare "${SOURCE_GIT_URL}" "${BARE_REPO}"
+          fi
+
+          BRANCH_COUNT="$(git -C "${BARE_REPO}" for-each-ref --format='%(refname)' refs/heads | wc -l | xargs)"
+          TAG_COUNT="$(git -C "${BARE_REPO}" for-each-ref --format='%(refname)' refs/tags | wc -l | xargs)"
+          [ "${BRANCH_COUNT}" -gt 0 ] || { echo "::error::源仓库没有可推送的分支"; exit 1; }
+          echo "检测到分支：${BRANCH_COUNT}；Tag：${TAG_COUNT}"
+          git -C "${BARE_REPO}" for-each-ref --format='分支：%(refname:strip=2)' refs/heads
+          git -C "${BARE_REPO}" for-each-ref --format='Tag：%(refname:strip=2)' refs/tags
+
+          if [ "${EXTERNAL_GIT_MODE}" = "mirror" ]; then
+            # 严格镜像全部可推送引用，并删除目标中源端不存在的引用。
+            # 排除 GitHub 禁止更新的 refs/pull，避免外部平台同名内部引用导致失败。
+            git -C "${BARE_REPO}" for-each-ref --format='%(refname)' refs/pull | while IFS= read -r ref; do
+              [ -n "${ref}" ] && git -C "${BARE_REPO}" update-ref -d "${ref}"
+            done
+            git -C "${BARE_REPO}" push --mirror "${TARGET_URL}"
+            echo "外部 Git 严格镜像完成：分支 ${BRANCH_COUNT} 个，Tag ${TAG_COUNT} 个。"
+          else
+            # 安全模式只同步 heads 和 tags，不删除目标额外引用。
+            git -C "${BARE_REPO}" push --force "${TARGET_URL}" 'refs/heads/*:refs/heads/*'
+            if [ "${TAG_COUNT}" -gt 0 ]; then
+              git -C "${BARE_REPO}" push --force "${TARGET_URL}" 'refs/tags/*:refs/tags/*'
+            fi
+            echo "外部 Git 安全同步完成：分支 ${BRANCH_COUNT} 个，Tag ${TAG_COUNT} 个。"
+          fi
 
   check-pat:
     name: 检查 WORKFLOW_PAT
     needs: prepare
-    if: ${{ inputs.run_check_pat || (inputs.run_sync_tags && inputs.tag_sync_mode == 'original_tag') }}
+    if: ${{ needs.prepare.outputs.source_kind != 'external_git' && (inputs.run_check_pat || (inputs.run_sync_tags && inputs.tag_sync_mode == 'original_tag')) }}
     runs-on: ubuntu-24.04
     env:
       TOKEN: ${{ secrets.WORKFLOW_PAT }}
@@ -382,7 +516,7 @@ jobs:
   sync-original-tags:
     name: 原样同步 Tag 和原始提交
     needs: [prepare, check-pat]
-    if: ${{ inputs.run_sync_tags && inputs.tag_sync_mode == 'original_tag' }}
+    if: ${{ inputs.run_sync_tags && needs.prepare.outputs.source_kind == 'github' && inputs.tag_sync_mode == 'original_tag' }}
     runs-on: ubuntu-24.04
     env:
       TOKEN: ${{ secrets.WORKFLOW_PAT }}
@@ -491,7 +625,7 @@ jobs:
   sync-clean-tags:
     name: 创建清理后的源码快照 Tag
     needs: prepare
-    if: ${{ inputs.run_sync_tags && inputs.tag_sync_mode == 'clean_snapshot' }}
+    if: ${{ inputs.run_sync_tags && needs.prepare.outputs.source_kind == 'github' && inputs.tag_sync_mode == 'clean_snapshot' }}
     runs-on: ubuntu-24.04
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -816,54 +950,97 @@ jobs:
           go install github.com/google/go-containerregistry/cmd/crane@v0.20.3
           echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
           "${HOME}/go/bin/crane" version
+
       - name: 生成镜像映射
         id: mappings
+        shell: bash
         run: |
           set -euo pipefail
-          MAP="${RUNNER_TEMP}/maps.tsv";:>"${MAP}"
+          MAP="${RUNNER_TEMP}/maps.tsv"
+          AUTH_MAP="${RUNNER_TEMP}/registry-auth.tsv"
+          :>"${MAP}"; :>"${AUTH_MAP}"
           if [ -z "${IMAGE_MAPPINGS}" ]; then
+            [ "${SOURCE_REPO}" != "none" ] || { echo "::error::src_repo=none 时必须填写 Docker 映射"; exit 1; }
             printf '%s\t%s\n' "ghcr.io/${SOURCE_REPO,,}" "${TARGET_REPO#*/}" > "${MAP}"
           else
-            printf '%s' "${IMAGE_MAPPINGS}"|tr ';；' '\n\n'|sed '/^$/d'|while read -r item;do
-              item="$(echo "${item}"|xargs)"
-              if [[ "${item}" == *"="* ]];then src="${item%%=*}";name="${item#*=}";else src="${item}";name="${src##*/}";fi
-              [ -n "${src}" ]&&[ -n "${name}" ]||exit 1
-              [[ "${src}" != *"@"* ]]||{ echo "::error::源镜像不能包含 Digest";exit 1;}
+            while IFS= read -r item; do
+              item="$(printf '%s' "${item}" | xargs)"; [ -n "${item}" ] || continue
+              mapping="${item%%|*}"; credentials=""
+              [[ "${item}" == *"|"* ]] && credentials="${item#*|}"
+              if [[ "${mapping}" == *"="* ]]; then src="${mapping%%=*}"; name="${mapping#*=}"; else src="${mapping}"; name="${src##*/}"; fi
+              src="$(printf '%s' "${src}"|xargs)"; name="$(printf '%s' "${name}"|xargs)"
+              [ -n "${src}" ] && [ -n "${name}" ] || { echo "::error::Docker 映射格式错误：${mapping}"; exit 1; }
+              [[ "${src}" != *"@"* ]] || { echo "::error::源镜像不能包含 Digest"; exit 1; }
               printf '%s\t%s\n' "${src,,}" "${name,,}" >> "${MAP}"
-            done
+              if [ -n "${credentials}" ]; then
+                [[ "${credentials}" == *"|"* ]] || { echo "::error::账号格式应为：源=目标|用户名|Token"; exit 1; }
+                username="${credentials%%|*}"; password="${credentials#*|}"
+                [ -n "${username}" ] && [ -n "${password}" ] || { echo "::error::用户名和 Token 均不能为空"; exit 1; }
+                registry="${src%%/*}"
+                printf '%s\t%s\t%s\n' "${registry,,}" "${username}" "${password}" >> "${AUTH_MAP}"
+                echo "::add-mask::${password}"
+              fi
+            done < <(printf '%s\n' "${IMAGE_MAPPINGS}" | sed 's/；/;/g; s/;/\n/g' | sed '/^[[:space:]]*$/d')
           fi
           sort -u "${MAP}" -o "${MAP}"
-          cat "${MAP}"
+          echo "Docker 映射："; awk -F '\t' '{print $1 " -> " $2}' "${MAP}"
           echo "map_file=${MAP}" >> "${GITHUB_OUTPUT}"
+          echo "auth_file=${AUTH_MAP}" >> "${GITHUB_OUTPUT}"
+
       - name: 登录源镜像仓库
-        if: ${{ env.SOURCE_USERNAME != '' && env.SOURCE_TOKEN != '' }}
         env:
           MAP: ${{ steps.mappings.outputs.map_file }}
+          AUTH_MAP: ${{ steps.mappings.outputs.auth_file }}
+        shell: bash
         run: |
           set -euo pipefail
-          cut -f1 "${MAP}"|awk -F/ '{print $1}'|sort -u|while read -r registry;do printf '%s' "${SOURCE_TOKEN}"|crane auth login "${registry}" --username "${SOURCE_USERNAME}" --password-stdin;done
+          login_one(){ local registry="$1" username="$2" password="$3"; echo "::add-mask::${password}"; echo "登录源镜像仓库：${registry}"; printf '%s' "${password}" | crane auth login "${registry}" --username "${username}" --password-stdin; }
+          if [ -s "${AUTH_MAP}" ]; then
+            while IFS=$'\t' read -r registry username password; do [ -n "${registry}" ] && login_one "${registry}" "${username}" "${password}"; done < "${AUTH_MAP}"
+          elif [ -n "${SOURCE_USERNAME}" ] || [ -n "${SOURCE_TOKEN}" ]; then
+            [ -n "${SOURCE_USERNAME}" ] && [ -n "${SOURCE_TOKEN}" ] || { echo "::error::SOURCE_REGISTRY_USERNAME 和 SOURCE_REGISTRY_TOKEN 必须同时设置"; exit 1; }
+            while IFS= read -r registry; do [ -n "${registry}" ] && login_one "${registry}" "${SOURCE_USERNAME}" "${SOURCE_TOKEN}"; done < <(cut -f1 "${MAP}"|awk -F/ '{print $1}'|sort -u)
+          else
+            echo "未提供源镜像仓库账号，使用匿名访问。"
+          fi
+
       - name: 登录目标 GHCR
         run: |
-          printf '%s' "${GHCR_TOKEN}"|crane auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | crane auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
       - name: 复制完整多架构镜像
         env:
           MAP: ${{ steps.mappings.outputs.map_file }}
+        shell: bash
         run: |
           set -euo pipefail
-          VERSIONS="${RUNNER_TEMP}/versions.json";SUMMARY="${RUNNER_TEMP}/summary.txt"
-          printf '%s' "${SELECTED_JSON}" > "${VERSIONS}";:>"${SUMMARY}"
-          OK=0;SKIP=0;MISSING=0;FAIL=0
-          while IFS=$'\t' read -r source_image target_name;do
-            target_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${target_name}";last=""
-            while read -r release_tag;do
-              source_tag="${release_tag}";[ "${STRIP_V_PREFIX}" = true ]&&source_tag="${source_tag#v}"
-              source_ref="${source_image}:${source_tag}";target_ref="${target_image}:${release_tag}"
-              if ! crane manifest "${source_ref}">/dev/null 2>&1;then echo "缺失 ${source_ref}" >> "${SUMMARY}";MISSING=$((MISSING+1));continue;fi
-              if [ "${SKIP_EXISTING}" = true ]&&crane manifest "${target_ref}">/dev/null 2>&1;then echo "跳过 ${target_ref}" >> "${SUMMARY}";SKIP=$((SKIP+1));continue;fi
-              if crane copy "${source_ref}" "${target_ref}";then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}";last="${source_ref}";OK=$((OK+1));else echo "失败 ${source_ref}" >> "${SUMMARY}";FAIL=$((FAIL+1));fi
+          VERSIONS="${RUNNER_TEMP}/versions.json"; SUMMARY="${RUNNER_TEMP}/summary.txt"
+          printf '%s' "${SELECTED_JSON}" > "${VERSIONS}"; :>"${SUMMARY}"
+          MAP_COUNT="$(awk 'NF{n++}END{print n+0}' "${MAP}")"; VERSION_COUNT="$(jq length "${VERSIONS}")"
+          [ "${MAP_COUNT}" -gt 0 ] || { echo "::error::没有生成 Docker 映射"; exit 1; }
+          [ "${VERSION_COUNT}" -gt 0 ] || { echo "::error::没有选中 Docker 版本"; exit 1; }
+          echo "准备搬运：镜像映射 ${MAP_COUNT} 个，精准版本 ${VERSION_COUNT} 个。"
+          OK=0; SKIP=0; MISSING=0; FAIL=0
+          while IFS=$'\t' read -r source_image target_name; do
+            target_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${target_name}"; last=""
+            while IFS= read -r release_tag; do
+              [ -n "${release_tag}" ] || continue
+              target_ref="${target_image}:${release_tag}"
+              if [ "${SKIP_EXISTING}" = true ] && crane manifest "${target_ref}" >/dev/null 2>&1; then echo "跳过 ${target_ref}" >> "${SUMMARY}"; SKIP=$((SKIP+1)); continue; fi
+              CANDIDATES=()
+              if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}" "${release_tag}");
+              else CANDIDATES+=("${release_tag}"); if [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}"); else CANDIDATES+=("v${release_tag}"); fi; fi
+              source_ref=""; checked=""
+              for candidate in "${CANDIDATES[@]}"; do
+                ref="${source_image}:${candidate}"; checked="${checked:+${checked}, }${ref}"
+                if crane manifest "${ref}" >/dev/null 2>&1; then source_ref="${ref}"; break; fi
+              done
+              if [ -z "${source_ref}" ]; then echo "缺失（已匹配）：${checked}" >> "${SUMMARY}"; MISSING=$((MISSING+1)); continue; fi
+              if crane copy "${source_ref}" "${target_ref}"; then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); else echo "失败 ${source_ref}" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
             done < <(jq -r '.[].tagName' "${VERSIONS}")
-            if [ "${UPDATE_LATEST}" = true ]&&[ -n "${last}" ];then crane copy "${last}" "${target_image}:latest"||FAIL=$((FAIL+1));fi
+            if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then crane copy "${last}" "${target_image}:latest" || FAIL=$((FAIL+1)); fi
           done < "${MAP}"
-          echo "Docker 成功：${OK}；跳过：${SKIP}；缺失：${MISSING}；失败：${FAIL}"
-          cat "${SUMMARY}"
+          echo "Docker 成功：${OK}；跳过：${SKIP}；缺失：${MISSING}；失败：${FAIL}"; cat "${SUMMARY}"
+          TOTAL=$((OK+SKIP+MISSING+FAIL)); [ "${TOTAL}" -gt 0 ] || { echo "::error::没有处理任何 Docker 镜像"; exit 1; }
           [ "${FAIL}" -eq 0 ]
